@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Expenses">
+<meta name="theme-color" content="#F2F2F7">
+<title>Expense Tracker</title>
+<link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect fill='%230A84FF' width='100' height='100' rx='22'/><text x='50' y='68' text-anchor='middle' font-size='52'>🧾</text></svg>">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body, #root { height: 100%; }
+  body { font-family: -apple-system, 'SF Pro Display', 'Helvetica Neue', sans-serif; background: #F2F2F7; overscroll-behavior: none; }
+  input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; }
+  input[type="number"] { -moz-appearance: textfield; }
+  @keyframes scanMove { 0%, 100% { top: 8px; } 50% { top: calc(100% - 12px); } }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+  @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script>
+const { useState, useRef, useEffect, createElement: h } = React;
+
+const CATEGORIES = [
+  { id: "travel", label: "Travel", icon: "✈️", color: "#0A84FF" },
+  { id: "meals", label: "Meals & Entertainment", icon: "🍽️", color: "#FF9F0A" },
+  { id: "other", label: "All Other", icon: "📦", color: "#30D158" },
+];
+
+const LS_KEY = "expense_tracker_data";
+function loadData() { try { return JSON.parse(localStorage.getItem(LS_KEY)) || []; } catch { return []; } }
+function saveData(trips) { localStorage.setItem(LS_KEY, JSON.stringify(trips)); }
+
+const fmt = (n) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(n);
+const fmtDate = (d) => new Date(d).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+
+// ─── OCR ───
+async function readReceipt(base64Image, apiKey) {
+  if (!apiKey) return { total: 0, description: "", date: "", confidence: "low", success: false, error: "no_key" };
+  try {
+    const base64Data = base64Image.replace(/^data:image\/\w+;base64,/, "");
+    const mediaType = base64Image.startsWith("data:image/png") ? "image/png" : "image/jpeg";
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1000,
+        messages: [{
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: mediaType, data: base64Data } },
+            { type: "text", text: 'Analyze this receipt image. Extract the following and respond ONLY with a JSON object (no markdown, no backticks, no extra text):\n{"total": <number - final total/amount paid including tax and tip. Use 0 if unreadable>, "description": "<string - merchant name and brief note, max 40 chars>", "date": "<string - date in YYYY-MM-DD format, or empty string if not found>", "confidence": "<high|medium|low>"}\n\nLook for the FINAL amount (grand total, total due, amount charged). Return just raw JSON.' }
+          ]
+        }]
+      }),
+    });
+    const data = await response.json();
+    if (data.error) return { total: 0, description: "", date: "", confidence: "low", success: false };
+    const text = data.content?.map(b => b.type === "text" ? b.text : "").join("") || "";
+    const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+    return { total: typeof parsed.total === "number" ? parsed.total : 0, description: parsed.description || "", date: parsed.date || "", confidence: parsed.confidence || "low", success: true };
+  } catch (err) {
+    console.error("OCR Error:", err);
+    return { total: 0, description: "", date: "", confidence: "low", success: false };
+  }
+}
+
+// ─── PDF ───
+function genPDF(trip, expenses, withReceipts) {
+  const byCat = CATEGORIES.map(c => { const items = expenses.filter(e => e.category === c.id); return { ...c, items, total: items.reduce((s, e) => s + e.amount, 0) }; });
+  const grand = expenses.reduce((s, e) => s + e.amount, 0);
+  let html = '<!DOCTYPE html><html><head><meta charset="utf-8"><style>@page{size:letter;margin:.75in}*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,Helvetica Neue,sans-serif;color:#1a1a2e;line-height:1.5}.header{border-bottom:3px solid #0A84FF;padding-bottom:16px;margin-bottom:24px}.header h1{font-size:28px;font-weight:700;color:#0A84FF}.header p{font-size:13px;color:#666;margin-top:4px}.section{margin-bottom:24px}.section-title{font-size:16px;font-weight:700;margin-bottom:10px;padding:8px 12px;border-radius:6px}table{width:100%;border-collapse:collapse;font-size:13px;margin-bottom:8px}th{text-align:left;padding:8px 10px;background:#f0f0f5;font-weight:600;border-bottom:2px solid #ddd}td{padding:8px 10px;border-bottom:1px solid #eee}.total-row td{font-weight:700;border-top:2px solid #333;background:#f8f8fc}.grand-total{font-size:20px;font-weight:800;text-align:right;padding:16px 0;border-top:3px solid #0A84FF;margin-top:16px;color:#0A84FF}.receipt-page{page-break-before:always}.receipt-img{max-width:100%;max-height:700px;border:1px solid #ddd;border-radius:8px;margin-top:12px}.receipt-meta{font-size:12px;color:#666;margin-top:8px}</style></head><body>';
+  html += '<div class="header"><h1>' + trip.name + '</h1><p>Created ' + fmtDate(trip.created) + ' &bull; ' + expenses.length + ' expense' + (expenses.length !== 1 ? 's' : '') + ' &bull; Generated ' + fmtDate(Date.now()) + '</p></div>';
+  byCat.forEach(c => {
+    if (!c.items.length) return;
+    html += '<div class="section"><div class="section-title" style="background:' + c.color + '15;color:' + c.color + '">' + c.icon + ' ' + c.label + '</div><table><thead><tr><th>Date</th><th>Description</th><th style="text-align:right">Amount</th></tr></thead><tbody>';
+    c.items.forEach(e => { html += '<tr><td>' + fmtDate(e.date) + '</td><td>' + (e.description || '—') + '</td><td style="text-align:right">' + fmt(e.amount) + '</td></tr>'; });
+    html += '<tr class="total-row"><td colspan="2">' + c.label + ' Total</td><td style="text-align:right">' + fmt(c.total) + '</td></tr></tbody></table></div>';
+  });
+  html += '<div class="grand-total">Grand Total: ' + fmt(grand) + '</div>';
+  if (withReceipts) {
+    expenses.forEach((e, i) => {
+      if (!e.receiptImage) return;
+      const cat = CATEGORIES.find(c => c.id === e.category);
+      html += '<div class="receipt-page"><h3 style="font-size:16px;margin-bottom:4px">Receipt #' + (i + 1) + '</h3><p class="receipt-meta">' + fmtDate(e.date) + ' &bull; ' + (cat?.label || '') + ' &bull; ' + fmt(e.amount) + (e.description ? ' &bull; ' + e.description : '') + '</p><img class="receipt-img" src="' + e.receiptImage + '" /></div>';
+    });
+  }
+  html += '</body></html>';
+  return html;
+}
+
+function printPDF(html) {
+  const w = window.open("", "_blank");
+  if (!w) { alert("Please allow popups to print/export."); return; }
+  w.document.write(html);
+  w.document.close();
+  setTimeout(() => w.print(), 600);
+}
+
+// ─── Styles ───
+const S = {
+  app: { maxWidth: 430, margin: "0 auto", minHeight: "100vh", background: "#F2F2F7", position: "relative", paddingTop: "env(safe-area-inset-top)" },
+  header: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 20px 14px", background: "rgba(242,242,247,0.92)", backdropFilter: "blur(20px)", WebkitBackdropFilter: "blur(20px)", position: "sticky", top: 0, zIndex: 50, borderBottom: "1px solid rgba(0,0,0,0.06)" },
+  title: { fontSize: 28, fontWeight: 800, color: "#1a1a2e", letterSpacing: -0.5 },
+  content: { padding: "12px 20px 120px" },
+  card: { background: "#fff", borderRadius: 16, padding: "16px 18px", boxShadow: "0 1px 3px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.03)", cursor: "pointer", position: "relative", marginBottom: 12 },
+  overlay: { position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", backdropFilter: "blur(4px)", WebkitBackdropFilter: "blur(4px)", display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 100, padding: 8 },
+  modal: { background: "#fff", borderRadius: 20, width: "100%", maxWidth: 400, overflow: "hidden", marginBottom: 20, boxShadow: "0 20px 60px rgba(0,0,0,0.3)", animation: "slideUp 0.3s ease-out" },
+  btnP: { padding: "14px 20px", background: "#0A84FF", color: "#fff", border: "none", borderRadius: 14, fontSize: 16, fontWeight: 700, cursor: "pointer", WebkitAppearance: "none" },
+  btnS: { padding: "14px 20px", background: "#E5E5EA", color: "#1a1a2e", border: "none", borderRadius: 14, fontSize: 16, fontWeight: 600, cursor: "pointer", WebkitAppearance: "none" },
+  input: { width: "100%", padding: "12px 14px", fontSize: 16, border: "2px solid #E5E5EA", borderRadius: 12, outline: "none", color: "#1a1a2e", background: "#FAFAFA", boxSizing: "border-box", WebkitAppearance: "none" },
+  label: { display: "block", fontSize: 13, fontWeight: 600, color: "#8E8E93", marginBottom: 6, textTransform: "uppercase", letterSpacing: 0.3 },
+  cancelBtn: { width: "100%", padding: 16, background: "none", border: "none", borderTop: "1px solid #E5E5EA", color: "#FF3B30", fontSize: 16, fontWeight: 600, cursor: "pointer" },
+  del: { position: "absolute", top: 8, right: 8, background: "none", border: "none", color: "#C7C7CC", fontSize: 14, cursor: "pointer", padding: 4 },
+  pill: { fontSize: 12, fontWeight: 600, padding: "3px 8px", borderRadius: 8, display: "inline-block" },
+  dot: { display: "inline-block", width: 8, height: 8, borderRadius: 4, verticalAlign: "middle", marginRight: 2 },
+};
+
+// ─── Settings Modal ───
+function Settings({ apiKey, onSave, onClose }) {
+  const [key, setKey] = useState(apiKey || "");
+  return h("div", { style: S.overlay },
+    h("div", { style: S.modal },
+      h("div", { style: { padding: 20 } },
+        h("h3", { style: { fontSize: 20, fontWeight: 700, color: "#1a1a2e" } }, "⚙️ Settings"),
+        h("p", { style: { color: "#8E8E93", fontSize: 14, marginTop: 6, marginBottom: 16 } }, "Enter your Anthropic API key to enable AI receipt reading. Your key is stored locally on this device only."),
+        h("label", { style: S.label }, "API Key"),
+        h("input", { type: "password", value: key, onChange: e => setKey(e.target.value), placeholder: "sk-ant-...", style: { ...S.input, fontFamily: "monospace", fontSize: 14 } }),
+        h("p", { style: { color: "#AEAEB2", fontSize: 12, marginTop: 8 } }, "Get your key at console.anthropic.com. Without a key, you can still add expenses manually."),
+        h("div", { style: { display: "flex", gap: 10, marginTop: 16 } },
+          h("button", { onClick: onClose, style: { ...S.btnS, flex: 1 } }, "Cancel"),
+          h("button", { onClick: () => { localStorage.setItem("anthropic_api_key", key); onSave(key); }, style: { ...S.btnP, flex: 1 } }, "Save")
+        )
+      )
+    )
+  );
+}
+
+// ─── Scanning ───
+function ScanningOverlay({ img }) {
+  const [dots, setDots] = useState("");
+  useEffect(() => { const iv = setInterval(() => setDots(d => d.length >= 3 ? "" : d + "."), 400); return () => clearInterval(iv); }, []);
+  return h("div", { style: S.overlay },
+    h("div", { style: S.modal },
+      h("div", { style: { padding: 24, textAlign: "center" } },
+        img && h("div", { style: { position: "relative", marginBottom: 20, overflow: "hidden", borderRadius: 12 } },
+          h("img", { src: img, style: { width: "100%", height: 180, objectFit: "cover", filter: "brightness(0.92)" } }),
+          h("div", { style: { position: "absolute", left: 8, right: 8, height: 3, background: "linear-gradient(90deg,transparent,#0A84FF,transparent)", borderRadius: 2, animation: "scanMove 1.8s ease-in-out infinite" } })
+        ),
+        h("div", { style: { display: "flex", justifyContent: "center" } },
+          h("div", { style: { width: 32, height: 32, border: "3px solid #E5E5EA", borderTopColor: "#0A84FF", borderRadius: "50%", animation: "spin 0.8s linear infinite" } })
+        ),
+        h("h3", { style: { fontWeight: 700, fontSize: 18, color: "#1a1a2e", marginTop: 16 } }, "Reading Receipt" + dots),
+        h("p", { style: { color: "#8E8E93", fontSize: 14, marginTop: 6 } }, "Extracting amount and details with AI")
+      )
+    )
+  );
+}
+
+// ─── Category Picker ───
+function CatPicker({ img, ocrData, onSelect, onCancel }) {
+  return h("div", { style: S.overlay },
+    h("div", { style: S.modal },
+      h("div", { style: { padding: "20px 20px 12px" } },
+        h("h3", { style: { fontSize: 20, fontWeight: 700, color: "#1a1a2e" } }, "Categorize Expense"),
+        h("p", { style: { color: "#8E8E93", fontSize: 14, marginTop: 4 } }, "Select a category for this receipt")
+      ),
+      img && h("div", { style: { padding: "0 20px 8px" } },
+        h("img", { src: img, style: { width: "100%", height: 140, objectFit: "cover", borderRadius: 12 } })
+      ),
+      ocrData?.success && ocrData.total > 0 && h("div", { style: { padding: "0 20px 12px" } },
+        h("div", { style: { display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", borderRadius: 10, background: "#F0F8FF", border: "1.5px solid #0A84FF30" } },
+          h("span", null, "🤖"),
+          h("span", { style: { fontSize: 13, color: "#1a1a2e" } },
+            "Detected: ", h("strong", null, fmt(ocrData.total)), ocrData.description ? " — " + ocrData.description : "")
+        )
+      ),
+      h("div", { style: { padding: "0 20px 20px", display: "flex", flexDirection: "column", gap: 10 } },
+        CATEGORIES.map(cat =>
+          h("button", { key: cat.id, onClick: () => onSelect(cat.id), style: { display: "flex", alignItems: "center", gap: 14, padding: "14px 16px", background: "#FAFAFA", border: "2px solid " + cat.color + "40", borderRadius: 14, cursor: "pointer", WebkitAppearance: "none" } },
+            h("span", { style: { fontSize: 28 } }, cat.icon),
+            h("span", { style: { fontWeight: 600, fontSize: 16, color: "#1a1a2e" } }, cat.label),
+            h("span", { style: { marginLeft: "auto", color: cat.color, fontSize: 20 } }, "›")
+          )
+        )
+      ),
+      h("button", { onClick: onCancel, style: S.cancelBtn }, "Cancel")
+    )
+  );
+}
+
+// ─── Expense Form ───
+function ExpForm({ category, img, ocrData, onSave, onCancel }) {
+  const autoRead = ocrData?.success && ocrData.total > 0;
+  const [amount, setAmount] = useState(autoRead ? ocrData.total.toFixed(2) : "");
+  const [desc, setDesc] = useState(ocrData?.description || "");
+  const [date, setDate] = useState(ocrData?.date && /^\d{4}-\d{2}-\d{2}$/.test(ocrData.date) ? ocrData.date : new Date().toISOString().slice(0, 10));
+  const cat = CATEGORIES.find(c => c.id === category);
+  const confMap = { high: { label: "High confidence", color: "#30D158", icon: "✓" }, medium: { label: "Verify amount", color: "#FF9F0A", icon: "!" }, low: { label: "Please check", color: "#FF3B30", icon: "?" } };
+  const conf = ocrData?.confidence ? confMap[ocrData.confidence] || confMap.low : confMap.low;
+  const valid = amount && !isNaN(parseFloat(amount)) && parseFloat(amount) > 0;
+
+  return h("div", { style: S.overlay },
+    h("div", { style: { ...S.modal, maxHeight: "90vh", overflowY: "auto" } },
+      h("div", { style: { padding: "20px 20px 0" } },
+        h("div", { style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 6 } },
+          h("span", { style: { fontSize: 28 } }, cat.icon),
+          h("h3", { style: { fontSize: 20, fontWeight: 700, color: "#1a1a2e" } }, cat.label)
+        ),
+        autoRead && h("div", { style: { display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", borderRadius: 10, border: "1.5px solid " + conf.color + "30", background: conf.color + "14", marginTop: 10 } },
+          h("span", { style: { fontSize: 14, fontWeight: 700, color: conf.color } }, conf.icon),
+          h("span", { style: { fontSize: 13, fontWeight: 600, color: conf.color } }, "Auto-read from receipt — " + conf.label.toLowerCase())
+        ),
+        !autoRead && img && h("div", { style: { display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", borderRadius: 10, border: "1.5px solid #FF3B3030", background: "#FF3B3014", marginTop: 10 } },
+          h("span", null, "⚠️"),
+          h("span", { style: { fontSize: 13, fontWeight: 600, color: "#FF3B30" } }, "Could not read receipt — please enter manually")
+        )
+      ),
+      h("div", { style: { padding: "12px 20px 20px", display: "flex", flexDirection: "column", gap: 14 } },
+        h("div", null,
+          h("label", { style: S.label }, "Amount *"),
+          h("div", { style: { position: "relative", display: "flex", alignItems: "center" } },
+            h("span", { style: { position: "absolute", left: 14, fontSize: 22, fontWeight: 700, color: "#1a1a2e", zIndex: 1 } }, "$"),
+            h("input", { type: "number", inputMode: "decimal", step: "0.01", min: "0", value: amount, onChange: e => setAmount(e.target.value), placeholder: "0.00", autoFocus: !autoRead, style: { ...S.input, paddingLeft: 32, fontSize: 22, fontWeight: 700, borderColor: autoRead ? conf.color + "60" : "#E5E5EA", background: autoRead ? conf.color + "08" : "#FAFAFA" } }),
+            autoRead && h("span", { style: { position: "absolute", right: 14, fontSize: 12, color: "#8E8E93", fontWeight: 500 } }, "✎ edit")
+          )
+        ),
+        h("div", null,
+          h("label", { style: S.label }, "Description"),
+          h("input", { type: "text", value: desc, onChange: e => setDesc(e.target.value), placeholder: "e.g., Uber to airport", style: S.input })
+        ),
+        h("div", null,
+          h("label", { style: S.label }, "Date"),
+          h("input", { type: "date", value: date, onChange: e => setDate(e.target.value), style: S.input })
+        ),
+        img && h("img", { src: img, style: { width: "100%", height: 100, objectFit: "cover", borderRadius: 12 } }),
+        h("div", { style: { display: "flex", gap: 10, marginTop: 4 } },
+          h("button", { onClick: onCancel, style: { ...S.btnS, flex: 1 } }, "Cancel"),
+          h("button", { onClick: () => { if (valid) onSave({ amount: parseFloat(amount), description: desc, date, category, receiptImage: img, id: Date.now().toString() }); }, disabled: !valid, style: { ...S.btnP, flex: 1, opacity: valid ? 1 : 0.4 } }, "Save Expense")
+        )
+      )
+    )
+  );
+}
+
+// ─── Export Modal ───
+function ExportModal({ trip, expenses, onClose }) {
+  return h("div", { style: S.overlay },
+    h("div", { style: S.modal },
+      h("div", { style: { padding: 20 } },
+        h("h3", { style: { fontSize: 20, fontWeight: 700, color: "#1a1a2e" } }, "Export & Print"),
+        h("p", { style: { color: "#8E8E93", fontSize: 14, marginTop: 4, marginBottom: 20 } }, 'Choose an export option for "' + trip.name + '"'),
+        h("div", { style: { display: "flex", flexDirection: "column", gap: 10 } },
+          h("button", { onClick: () => printPDF(genPDF(trip, expenses, false)), style: { display: "flex", alignItems: "center", gap: 14, padding: "14px 16px", background: "#FAFAFA", border: "2px solid #E5E5EA", borderRadius: 14, cursor: "pointer", textAlign: "left", width: "100%", WebkitAppearance: "none" } },
+            h("span", { style: { fontSize: 24 } }, "📊"),
+            h("div", null,
+              h("div", { style: { fontWeight: 600, fontSize: 15, color: "#1a1a2e" } }, "Summary Only"),
+              h("div", { style: { fontSize: 12, color: "#8E8E93" } }, "Expense table by category")
+            )
+          ),
+          h("button", { onClick: () => printPDF(genPDF(trip, expenses, true)), style: { display: "flex", alignItems: "center", gap: 14, padding: "14px 16px", background: "#FAFAFA", border: "2px solid #E5E5EA", borderRadius: 14, cursor: "pointer", textAlign: "left", width: "100%", WebkitAppearance: "none" } },
+            h("span", { style: { fontSize: 24 } }, "🧾"),
+            h("div", null,
+              h("div", { style: { fontWeight: 600, fontSize: 15, color: "#1a1a2e" } }, "Summary + Receipts"),
+              h("div", { style: { fontSize: 12, color: "#8E8E93" } }, "Full report with receipt images")
+            )
+          )
+        ),
+        h("p", { style: { fontSize: 11, color: "#AEAEB2", textAlign: "center", marginTop: 16 } }, "Uses AirPrint or Save as PDF from the print dialog")
+      ),
+      h("button", { onClick: onClose, style: S.cancelBtn }, "Cancel")
+    )
+  );
+}
+
+// ─── Main App ───
+function App() {
+  const [trips, setTrips] = useState(loadData);
+  const [activeTrip, setActiveTrip] = useState(null);
+  const [view, setView] = useState("trips");
+  const [showNewTrip, setShowNewTrip] = useState(false);
+  const [newTripName, setNewTripName] = useState("");
+  const [pendingImage, setPendingImage] = useState(null);
+  const [showCatPicker, setShowCatPicker] = useState(false);
+  const [selectedCat, setSelectedCat] = useState(null);
+  const [showForm, setShowForm] = useState(false);
+  const [showExport, setShowExport] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [ocrData, setOcrData] = useState(null);
+  const [showSettings, setShowSettings] = useState(false);
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem("anthropic_api_key") || "");
+  const fileRef = useRef(null);
+
+  useEffect(() => { saveData(trips); }, [trips]);
+
+  const trip = trips.find(t => t.id === activeTrip);
+  const tripExp = trip ? trip.expenses : [];
+
+  const addTrip = () => {
+    if (!newTripName.trim()) return;
+    const t = { id: Date.now().toString(), name: newTripName.trim(), created: Date.now(), expenses: [] };
+    setTrips(p => [t, ...p]); setNewTripName(""); setShowNewTrip(false); setActiveTrip(t.id); setView("detail");
+  };
+  const delTrip = id => { setTrips(p => p.filter(t => t.id !== id)); if (activeTrip === id) { setActiveTrip(null); setView("trips"); } };
+  const addExp = exp => { setTrips(p => p.map(t => t.id === activeTrip ? { ...t, expenses: [...t.expenses, exp] } : t)); reset(); };
+  const delExp = eid => { setTrips(p => p.map(t => t.id === activeTrip ? { ...t, expenses: t.expenses.filter(e => e.id !== eid) } : t)); };
+
+  const reset = () => { setPendingImage(null); setShowCatPicker(false); setSelectedCat(null); setShowForm(false); setScanning(false); setOcrData(null); };
+
+  const handleFile = async e => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async ev => {
+      const img = ev.target.result;
+      setPendingImage(img);
+      if (apiKey) {
+        setScanning(true);
+        const result = await readReceipt(img, apiKey);
+        setOcrData(result);
+        setScanning(false);
+      }
+      setShowCatPicker(true);
+    };
+    reader.readAsDataURL(file);
+    e.target.value = "";
+  };
+
+  const handleCat = catId => { setSelectedCat(catId); setShowCatPicker(false); setShowForm(true); };
+  const handleManual = () => { setPendingImage(null); setOcrData(null); setSelectedCat(null); setShowCatPicker(true); };
+
+  const byCat = CATEGORIES.map(c => { const items = tripExp.filter(e => e.category === c.id); return { ...c, items, total: items.reduce((s, e) => s + e.amount, 0) }; });
+  const grand = tripExp.reduce((s, e) => s + e.amount, 0);
+
+  // ─── Trips List ───
+  if (view === "trips") {
+    return h("div", { style: S.app },
+      h("div", { style: S.header },
+        h("h1", { style: S.title }, "Expenses"),
+        h("div", { style: { display: "flex", gap: 8, alignItems: "center" } },
+          h("button", { onClick: () => setShowSettings(true), style: { background: "none", border: "none", fontSize: 22, cursor: "pointer", padding: 4 } }, "⚙️"),
+          h("button", { onClick: () => setShowNewTrip(true), style: { background: "#0A84FF", color: "#fff", border: "none", borderRadius: 20, padding: "8px 16px", fontSize: 14, fontWeight: 600, cursor: "pointer" } }, "+ New Trip")
+        )
+      ),
+
+      showSettings && h(Settings, { apiKey, onSave: k => { setApiKey(k); setShowSettings(false); }, onClose: () => setShowSettings(false) }),
+
+      showNewTrip && h("div", { style: S.overlay },
+        h("div", { style: S.modal },
+          h("div", { style: { padding: 20 } },
+            h("h3", { style: { fontSize: 20, fontWeight: 700, color: "#1a1a2e" } }, "New Trip"),
+            h("input", { type: "text", value: newTripName, onChange: e => setNewTripName(e.target.value), placeholder: "e.g., NYC Conference 2026", style: { ...S.input, marginTop: 14 }, autoFocus: true, onKeyDown: e => e.key === "Enter" && addTrip() }),
+            h("div", { style: { display: "flex", gap: 10, marginTop: 16 } },
+              h("button", { onClick: () => { setShowNewTrip(false); setNewTripName(""); }, style: { ...S.btnS, flex: 1 } }, "Cancel"),
+              h("button", { onClick: addTrip, disabled: !newTripName.trim(), style: { ...S.btnP, flex: 1, opacity: newTripName.trim() ? 1 : 0.4 } }, "Create")
+            )
+          )
+        )
+      ),
+
+      h("div", { style: S.content },
+        trips.length === 0
+          ? h("div", { style: { textAlign: "center", padding: "60px 20px" } },
+              h("div", { style: { fontSize: 56, marginBottom: 12 } }, "🧳"),
+              h("h3", { style: { fontWeight: 700, fontSize: 20, color: "#1a1a2e", marginBottom: 6 } }, "No trips yet"),
+              h("p", { style: { color: "#8E8E93", fontSize: 15, maxWidth: 260, margin: "0 auto" } }, "Create a trip to start tracking your expenses with receipt photos."),
+              !apiKey && h("p", { style: { color: "#FF9F0A", fontSize: 13, marginTop: 16 } }, "💡 Tap ⚙️ to add your API key for AI receipt reading")
+            )
+          : trips.map(t => {
+              const total = t.expenses.reduce((s, e) => s + e.amount, 0);
+              return h("div", { key: t.id, style: S.card, onClick: () => { setActiveTrip(t.id); setView("detail"); } },
+                h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-start" } },
+                  h("div", null,
+                    h("h3", { style: { fontWeight: 700, fontSize: 17, color: "#1a1a2e" } }, t.name),
+                    h("p", { style: { fontSize: 13, color: "#8E8E93", marginTop: 3 } }, fmtDate(t.created) + " · " + t.expenses.length + " expense" + (t.expenses.length !== 1 ? "s" : ""))
+                  ),
+                  h("p", { style: { fontWeight: 700, fontSize: 18, color: "#0A84FF", fontVariantNumeric: "tabular-nums" } }, fmt(total))
+                ),
+                h("div", { style: { display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap" } },
+                  CATEGORIES.map(cat => {
+                    const ct = t.expenses.filter(e => e.category === cat.id).reduce((s, e) => s + e.amount, 0);
+                    if (!ct) return null;
+                    return h("span", { key: cat.id, style: { ...S.pill, background: cat.color + "18", color: cat.color } }, cat.icon + " " + fmt(ct));
+                  })
+                ),
+                h("button", { onClick: e => { e.stopPropagation(); if (confirm('Delete "' + t.name + '"?')) delTrip(t.id); }, style: S.del }, "✕")
+              );
+            })
+      )
+    );
+  }
+
+  // ─── Trip Detail ───
+  return h("div", { style: S.app },
+    h("div", { style: S.header },
+      h("button", { onClick: () => setView("trips"), style: { background: "none", border: "none", color: "#0A84FF", fontSize: 17, fontWeight: 500, cursor: "pointer" } }, "‹ Trips"),
+      h("h1", { style: { ...S.title, fontSize: 17, flex: 1, textAlign: "center" } }, trip?.name),
+      h("button", { onClick: () => setShowExport(true), disabled: !tripExp.length, style: { background: "none", border: "none", color: "#0A84FF", fontSize: 15, fontWeight: 600, cursor: "pointer", opacity: tripExp.length ? 1 : 0.35 } }, "Export")
+    ),
+
+    h("input", { type: "file", ref: fileRef, accept: "image/*", capture: "environment", onChange: handleFile, style: { display: "none" } }),
+
+    scanning && h(ScanningOverlay, { img: pendingImage }),
+    showCatPicker && h(CatPicker, { img: pendingImage, ocrData, onSelect: handleCat, onCancel: reset }),
+    showForm && h(ExpForm, { category: selectedCat, img: pendingImage, ocrData, onSave: addExp, onCancel: reset }),
+    showExport && h(ExportModal, { trip, expenses: tripExp, onClose: () => setShowExport(false) }),
+
+    h("div", { style: S.content },
+      // Summary
+      h("div", { style: { display: "flex", flexDirection: "column", gap: 8 } },
+        h("div", { style: { borderRadius: 16, padding: "18px 20px", background: "linear-gradient(135deg, #0A84FF, #0066CC)", boxShadow: "0 2px 12px rgba(10,132,255,0.2)" } },
+          h("p", { style: { fontSize: 12, fontWeight: 600, color: "rgba(255,255,255,0.75)", letterSpacing: 0.5, textTransform: "uppercase" } }, "Grand Total"),
+          h("p", { style: { fontSize: 28, fontWeight: 800, color: "#fff", fontVariantNumeric: "tabular-nums", marginTop: 4 } }, fmt(grand)),
+          h("p", { style: { fontSize: 12, color: "rgba(255,255,255,0.6)", marginTop: 2 } }, tripExp.length + " expense" + (tripExp.length !== 1 ? "s" : ""))
+        ),
+        byCat.map(cat =>
+          h("div", { key: cat.id, style: { background: "#fff", borderRadius: 14, padding: "14px 16px", boxShadow: "0 1px 3px rgba(0,0,0,0.04)", borderLeft: "4px solid " + cat.color } },
+            h("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
+              h("span", { style: { fontSize: 18 } }, cat.icon),
+              h("span", { style: { fontWeight: 600, fontSize: 13, color: "#8E8E93" } }, cat.label)
+            ),
+            h("p", { style: { fontWeight: 700, fontSize: 20, color: "#1a1a2e", marginTop: 6, fontVariantNumeric: "tabular-nums" } }, fmt(cat.total)),
+            h("p", { style: { fontSize: 12, color: "#AEAEB2" } }, cat.items.length + " item" + (cat.items.length !== 1 ? "s" : ""))
+          )
+        )
+      ),
+
+      // Buttons
+      h("div", { style: { display: "flex", gap: 10, margin: "20px 0 16px" } },
+        h("button", { style: { ...S.btnP, flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }, onClick: () => fileRef.current?.click() },
+          h("span", { style: { fontSize: 20 } }, "📸"), " Scan Receipt"),
+        h("button", { style: { ...S.btnS, flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }, onClick: handleManual },
+          h("span", { style: { fontSize: 18 } }, "✏️"), " Manual Entry")
+      ),
+
+      // Expense list
+      tripExp.length === 0
+        ? h("div", { style: { textAlign: "center", paddingTop: 40 } },
+            h("div", { style: { fontSize: 48, marginBottom: 10 } }, "🧾"),
+            h("h3", { style: { fontWeight: 700, fontSize: 18, color: "#1a1a2e", marginBottom: 4 } }, "No expenses yet"),
+            h("p", { style: { color: "#8E8E93", fontSize: 14 } }, "Scan a receipt or add one manually")
+          )
+        : h("div", { style: { display: "flex", flexDirection: "column", gap: 8 } },
+            h("h3", { style: { fontWeight: 700, fontSize: 15, color: "#8E8E93", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 4 } }, "All Expenses"),
+            [...tripExp].sort((a, b) => new Date(b.date) - new Date(a.date)).map(e => {
+              const cat = CATEGORIES.find(c => c.id === e.category);
+              return h("div", { key: e.id, style: { background: "#fff", borderRadius: 14, padding: "12px 14px", display: "flex", alignItems: "center", gap: 12, position: "relative", boxShadow: "0 1px 3px rgba(0,0,0,0.04)" } },
+                e.receiptImage
+                  ? h("img", { src: e.receiptImage, style: { width: 48, height: 48, borderRadius: 10, objectFit: "cover", flexShrink: 0 } })
+                  : h("div", { style: { width: 48, height: 48, borderRadius: 10, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", background: cat.color + "15", fontSize: 22 } }, cat.icon),
+                h("div", { style: { flex: 1, minWidth: 0 } },
+                  h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "flex-start" } },
+                    h("div", { style: { minWidth: 0 } },
+                      h("p", { style: { fontWeight: 600, fontSize: 15, color: "#1a1a2e", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" } }, e.description || cat.label),
+                      h("p", { style: { fontSize: 12, color: "#8E8E93", marginTop: 2 } },
+                        h("span", { style: { ...S.dot, background: cat.color } }), " " + cat.label + " · " + fmtDate(e.date))
+                    ),
+                    h("p", { style: { fontWeight: 700, fontSize: 16, color: "#1a1a2e", fontVariantNumeric: "tabular-nums", whiteSpace: "nowrap", marginLeft: 12 } }, fmt(e.amount))
+                  )
+                ),
+                h("button", { onClick: () => delExp(e.id), style: S.del }, "✕")
+              );
+            })
+          )
+    )
+  );
+}
+
+ReactDOM.render(h(App), document.getElementById("root"));
+</script>
+</body>
+</html>
